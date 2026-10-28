@@ -6,10 +6,27 @@ static void handleAccessoryConfigurationDone(int32_t result, int32_t count, void
 
     g_accessoryConfigPending = 0;
 
-    if (g_usb.state == USB_IDLE)
+    /*
+     A SET_CONFIGURATION completion can arrive after the accessory detached
+     and the session moved back to WAITING_FOR_ACCESSORY. Do not let that
+     stale completion turn into a configuration success or failure.
+     */
+    if (g_usb.state != USB_OPENING_BULK || g_accessoryDeviceId < 0)
         return;
 
     if (result < 0) {
+        if (result == (int)SCE_USBD_ERROR_8024000A &&
+            g_accessoryConfigRetryCount < AA_CONFIG_MAX_RETRIES) {
+            ++g_accessoryConfigRetryCount;
+            g_accessoryConfigRetryPolls = AA_CONFIG_RETRY_POLLS;
+            g_accessoryConfigRetryPending = 1;
+            ksceDebugPrintf(
+                "[VitaAutoUSB] SET_CONFIGURATION transient; retry %d\n",
+                g_accessoryConfigRetryCount
+            );
+            return;
+        }
+
         ksceDebugPrintf(
             "[VitaAutoUSB] SET_CONFIGURATION failed: result=0x%08x count=%d\n",
             result,
@@ -20,6 +37,10 @@ static void handleAccessoryConfigurationDone(int32_t result, int32_t count, void
     }
 
     g_accessoryConfigured = 1;
+    g_accessoryDetachCount = 0;
+    g_accessoryConfigRetryCount = 0;
+    g_accessoryConfigRetryPolls = 0;
+    g_accessoryConfigRetryPending = 0;
     g_versionSettlePolls = AA_CONFIG_SETTLE_POLLS;
     vitaUsbLogInfo("[VitaAutoUSB] Accessory configuration active\n");
 }
@@ -77,12 +98,27 @@ static int openAccessoryBulkPipes(int deviceId)
     return 0;
 }
 
+static int submitAccessoryConfiguration(void)
+{
+    g_accessoryConfigPending = 1;
+    g_accessoryConfigured = 0;
+    return queueControlTransfer(
+        g_accessoryControlPipe,
+        &g_accessoryConfigRequest,
+        NULL,
+        accessoryConfigurationDone,
+        NULL
+    );
+}
+
 static int startAndroidAutoVersionHandshake(int deviceId)
 {
     const SceUsbdConfigurationDescriptor *configuration;
     int submitResult;
 
     g_usb.state = USB_OPENING_BULK;
+    g_accessorySetupPending = 0;
+    g_accessorySetupPolls = 0;
 
     configuration = ksceUsbdScanStaticDescriptor(
         deviceId,
@@ -126,8 +162,9 @@ static int startAndroidAutoVersionHandshake(int deviceId)
     g_versionSettlePolls = 0;
     g_versionWriteCompleted = 0;
     g_versionRetryCount = 0;
-    g_accessoryConfigPending = 1;
-    g_accessoryConfigured = 0;
+    g_accessoryConfigRetryCount = 0;
+    g_accessoryConfigRetryPolls = 0;
+    g_accessoryConfigRetryPending = 0;
 
     g_accessoryConfigRequest.bmRequestType = 0x00;
     g_accessoryConfigRequest.bRequest = SCE_USBD_REQUEST_SET_CONFIGURATION;
@@ -141,15 +178,10 @@ static int startAndroidAutoVersionHandshake(int deviceId)
         configuration->bNumInterfaces
     );
 
-    submitResult = queueControlTransfer(
-        g_accessoryControlPipe,
-        &g_accessoryConfigRequest,
-        NULL,
-        accessoryConfigurationDone,
-        NULL
-    );
+    submitResult = submitAccessoryConfiguration();
     if (submitResult < 0) {
         g_accessoryConfigPending = 0;
+        g_accessoryConfigRetryPending = 0;
         ksceDebugPrintf(
             "[VitaAutoUSB] Could not submit SET_CONFIGURATION: 0x%08x\n",
             submitResult
@@ -161,33 +193,142 @@ static int startAndroidAutoVersionHandshake(int deviceId)
     return 0;
 }
 
+static int submitGetProtocol(void)
+{
+    return submitControlRequest(
+        USB_REQ_TO_HOST_VENDOR,
+        USB_GET_PROTOCOL,
+        0,
+        0,
+        sizeof(g_usb.protocol),
+        g_usb.protocol
+    );
+}
+
 static void pumpAndroidAutoVersionHandshake(void)
 {
-    if (g_usb.state == USB_GETTING_PROTOCOL && g_protocolRequestPending) {
-        int submitResult;
-
-        if (g_protocolSettlePolls > 0) {
-            --g_protocolSettlePolls;
+    if (g_normalSetupPending) {
+        if (g_usb.state != USB_GETTING_PROTOCOL || g_normalDeviceId < 0) {
+            g_normalSetupPending = 0;
+            g_normalSetupPolls = 0;
             return;
         }
-        if (g_usb.controlPipe < 0)
+        if (g_normalSetupPolls > 0) {
+            --g_normalSetupPolls;
             return;
+        }
 
-        g_protocolRequestPending = 0;
-        submitResult = submitControlRequest(
-            USB_REQ_TO_HOST_VENDOR,
-            USB_GET_PROTOCOL,
-            0,
-            0,
-            sizeof(g_usb.protocol),
-            g_usb.protocol
-        );
-        if (submitResult < 0)
-            setUsbFailure(
-                VITA_AUTO_USB_FAILURE_PROTOCOL_SUBMIT,
-                submitResult,
-                g_protocolRetryCount
+        g_normalSetupPending = 0;
+        g_usb.controlPipe = ksceUsbdOpenPipe(g_normalDeviceId, NULL);
+        if (g_usb.controlPipe < 0) {
+            ksceDebugPrintf(
+                "[VitaAutoUSB] Could not open control pipe: 0x%08x\n",
+                g_usb.controlPipe
             );
+            setUsbFailure(
+                VITA_AUTO_USB_FAILURE_CONTROL_PIPE_OPEN,
+                g_usb.controlPipe,
+                0
+            );
+            return;
+        }
+
+        {
+            const int submitResult = submitGetProtocol();
+            if (submitResult < 0) {
+                setUsbFailure(
+                    VITA_AUTO_USB_FAILURE_PROTOCOL_SUBMIT,
+                    submitResult,
+                    0
+                );
+            }
+        }
+        return;
+    }
+
+    if (g_aoaRetryPending) {
+        int submitResult;
+
+        if (g_usb.state != g_aoaRetryState) {
+            g_aoaRetryPending = 0;
+            return;
+        }
+        if (g_aoaRetryPolls > 0) {
+            --g_aoaRetryPolls;
+            return;
+        }
+
+        g_aoaRetryPending = 0;
+        if (g_aoaRetryState == USB_GETTING_PROTOCOL) {
+            submitResult = submitGetProtocol();
+        } else if (g_aoaRetryState == USB_SENDING_STRINGS) {
+            g_usb.stringIndex = (unsigned int)g_aoaRetryStringIndex;
+            submitResult = submitNextString();
+        } else if (g_aoaRetryState == USB_STARTING) {
+            submitResult = submitStart();
+        } else {
+            return;
+        }
+
+        if (submitResult < 0) {
+            if (g_aoaRetryState == USB_GETTING_PROTOCOL)
+                setUsbFailure(VITA_AUTO_USB_FAILURE_PROTOCOL_SUBMIT, submitResult, 0);
+            else
+                setUsbFailure(
+                    VITA_AUTO_USB_FAILURE_CONTROL_TRANSFER,
+                    submitResult,
+                    g_aoaRetryCount
+                );
+        }
+        return;
+    }
+
+    if (g_accessoryConfigRetryPending) {
+        int submitResult;
+
+        if (g_usb.state != USB_OPENING_BULK || g_accessoryDeviceId < 0) {
+            g_accessoryConfigRetryPending = 0;
+            g_accessoryConfigRetryPolls = 0;
+            return;
+        }
+        if (g_accessoryConfigRetryPolls > 0) {
+            --g_accessoryConfigRetryPolls;
+            return;
+        }
+
+        g_accessoryConfigRetryPending = 0;
+        submitResult = submitAccessoryConfiguration();
+        if (submitResult < 0) {
+            g_accessoryConfigPending = 0;
+            setUsbFailure(
+                VITA_AUTO_USB_FAILURE_CONFIGURATION_SUBMIT,
+                submitResult,
+                0
+            );
+        }
+        return;
+    }
+
+    if (g_accessorySetupPending) {
+        if (g_usb.state != USB_OPENING_BULK || g_accessoryDeviceId < 0) {
+            g_accessorySetupPending = 0;
+            g_accessorySetupPolls = 0;
+            return;
+        }
+        if (g_accessorySetupPolls > 0) {
+            --g_accessorySetupPolls;
+            return;
+        }
+
+        g_accessorySetupPending = 0;
+        if (startAndroidAutoVersionHandshake(g_accessoryDeviceId) < 0) {
+            if (g_usb.state != USB_FAILED)
+                setUsbFailure(
+                    VITA_AUTO_USB_FAILURE_ACCESSORY_CONFIGURATION_SETUP,
+                    -1,
+                    0
+                );
+        }
         return;
     }
 
@@ -263,9 +404,25 @@ static int handleUsbProbe(int deviceId)
      Google accessory identity may be assigned a new SceUsbd device ID
      before the Samsung identity's detach callback arrives.
      */
-    if (g_usb.deviceId >= 0 && g_usb.deviceId != deviceId &&
-        !(g_waitingForAccessory && isAccessoryDevice(device))) {
-        return SCE_USBD_PROBE_FAILED;
+    if (g_usb.deviceId >= 0 && g_usb.deviceId != deviceId) {
+        /*
+         The accessory can attach before the START completion callback and
+         before the normal detach callback. Accept 18d1 as soon as START has
+         been submitted, not only after START reports success.
+         */
+        const int waitingForPhone =
+            g_waitingForAccessory ||
+            g_usb.state == USB_STARTING ||
+            g_usb.state == USB_WAITING_FOR_ACCESSORY;
+        const int accessoryExpected =
+            waitingForPhone && isAccessoryDevice(device);
+        const int normalRetry =
+            waitingForPhone && isSupportedAndroidVendor(device->idVendor);
+
+        /* While waiting for 18d1, also accept the normal phone reappearing
+           after a failed/aborted AOA switch so the handshake can restart. */
+        if (!accessoryExpected && !normalRetry)
+            return SCE_USBD_PROBE_FAILED;
     }
 
     vitaUsbLogInfo(
@@ -288,56 +445,154 @@ static int handleUsbAttach(int deviceId)
     );
 
     g_usb.deviceId = deviceId;
+    g_aoaRetryCount = 0;
+    g_aoaRetryPolls = 0;
+    g_aoaRetryPending = 0;
+    g_aoaRetryState = 0;
+    g_aoaRetryStringIndex = 0;
+    g_normalSetupPending = 0;
+    g_normalSetupPolls = 0;
+    g_accessorySetupPending = 0;
+    g_accessorySetupPolls = 0;
+    g_accessoryConfigRetryCount = 0;
+    g_accessoryConfigRetryPolls = 0;
+    g_accessoryConfigRetryPending = 0;
 
     if (device != NULL && isAccessoryDevice(device)) {
-        g_staleAccessory = !g_waitingForAccessory && g_usb.state == USB_IDLE;
         g_accessoryDeviceId = deviceId;
         g_waitingForAccessory = 0;
-        if (startAndroidAutoVersionHandshake(deviceId) < 0) {
-            if (g_usb.state != USB_FAILED)
-                setUsbFailure(VITA_AUTO_USB_FAILURE_BULK_PIPE_OPEN, -1, 0);
-            return SCE_USBD_ATTACH_FAILED;
-        }
+        g_earlyDetachCount = 0;
+        g_accessorySetupPending = 1;
+        g_accessorySetupPolls = AA_ACCESSORY_SETUP_POLLS;
+        g_accessoryConfigPending = 0;
+        g_accessoryConfigured = 0;
+        g_versionSettlePolls = 0;
+        g_versionWriteCompleted = 0;
+        g_usb.state = USB_OPENING_BULK;
+        /*
+         Do not open pipes or submit SET_CONFIGURATION from inside SceUsbd's
+         attach callback. The phone's accessory gadget may still be settling;
+         the GetState pump performs setup a few polls later, outside USBD
+         callback context.
+         */
         return SCE_USBD_ATTACH_SUCCEEDED;
     }
 
     g_normalDeviceId = deviceId;
     g_accessoryDeviceId = -1;
     g_waitingForAccessory = 0;
-
-    g_usb.controlPipe = ksceUsbdOpenPipe(deviceId, NULL);
-
-    if (g_usb.controlPipe < 0) {
-        ksceDebugPrintf("[VitaAutoUSB] Could not open control pipe: 0x%08x\n", g_usb.controlPipe);
-        setUsbFailure(VITA_AUTO_USB_FAILURE_CONTROL_PIPE_OPEN, g_usb.controlPipe, 0);
-        return SCE_USBD_ATTACH_FAILED;
-    }
-
-    g_protocolRetryCount = 0;
-    g_protocolSettlePolls = USB_PROTOCOL_SETTLE_POLLS;
-    __sync_synchronize();
-    g_protocolRequestPending = 1;
+    g_normalSetupPending = 1;
+    g_normalSetupPolls = AA_NORMAL_SETUP_POLLS;
     g_usb.state = USB_GETTING_PROTOCOL;
-
+    /*
+     Do not submit GET_PROTOCOL from inside SceUsbd's attach callback. The
+     phone's MTP gadget can still be initializing; a vendor request that
+     arrives too early makes some phones reset and disappear. The GetState
+     pump starts AOA a few polls later, outside USBD callback context.
+     */
     return SCE_USBD_ATTACH_SUCCEEDED;
 }
 
 static int handleUsbDetach(int deviceId)
 {
+    g_aoaRetryPending = 0;
+    g_aoaRetryState = 0;
+    g_aoaRetryStringIndex = 0;
+    g_normalSetupPending = 0;
+    g_normalSetupPolls = 0;
+    g_accessorySetupPending = 0;
+    g_accessorySetupPolls = 0;
+    g_accessoryConfigPending = 0;
+    g_accessoryConfigured = 0;
+    g_versionSettlePolls = 0;
+    g_versionWriteCompleted = 0;
+
     // USBD has already invalidated this device's pipes before notifying us.
     if (deviceId == g_normalDeviceId) {
         __sync_lock_test_and_set(&g_usb.controlPipe, -1);
         g_normalDeviceId = -1;
-        if (g_waitingForAccessory || g_accessoryDeviceId >= 0)
+        if (g_waitingForAccessory || g_accessoryDeviceId >= 0) {
+            /* Allow either the accessory identity or a normal re-enumeration
+               (AOA failed and the phone came back as MTP) to attach next. */
+            g_usb.deviceId = -1;
             return SCE_USBD_DETACH_SUCCEEDED;
+        }
+
+        /*
+         A phone can drop while its MTP gadget is settling or while the
+         first AOA request is in flight, then re-enumerate after a power or
+         cable reset. Do not retire the session yet: keep admission open so
+         the next attach can retry the AOA handshake without relaunching the
+         app. The app's 60-second open timeout remains the outer bound.
+         */
+        if (g_usb.state >= USB_GETTING_PROTOCOL &&
+            g_usb.state <= USB_STARTING) {
+            const int detachState = (int)g_usb.state;
+
+            ++g_earlyDetachCount;
+            g_lastFailureStage = VITA_AUTO_USB_FAILURE_DETACH;
+            g_lastFailureResult = (int)SCE_USBD_ERROR_DEVICE_NOT_FOUND;
+            g_lastFailureCount = detachState;
+            ksceDebugPrintf(
+                "[VitaAutoUSB] Early detach state=%d retry=%d\n",
+                detachState,
+                g_earlyDetachCount
+            );
+            g_usb.state = USB_IDLE;
+            g_usb.deviceId = -1;
+            if (g_earlyDetachCount >= AA_EARLY_DETACH_MAX_RETRIES)
+                retireSession(USB_FAILED);
+            return SCE_USBD_DETACH_SUCCEEDED;
+        }
     }
 
     if (deviceId == g_accessoryDeviceId || deviceId == g_usb.deviceId) {
-        if (sessionIsOpen()) {
-            g_lastFailureStage = VITA_AUTO_USB_FAILURE_DETACHED;
-            g_lastFailureResult = 0;
-            g_lastFailureCount = (int)g_usb.state;
+        /*
+         A detach is not a USBD transfer error, so record a synthetic
+         diagnostic. This lets the app log distinguish "phone
+         unplugged/suspended" from a bulk-read failure.
+        */
+        const int detachState = (int)g_usb.state;
+
+        g_lastFailureStage = VITA_AUTO_USB_FAILURE_DETACH;
+        g_lastFailureResult = (int)SCE_USBD_ERROR_DEVICE_NOT_FOUND;
+        /* Third diagnostic field: the AOA state at detach. This distinguishes
+           a normal-identity disconnect (1) from accessory setup (5). */
+        g_lastFailureCount = detachState;
+
+        /*
+         Some phones briefly drop the 18d1 identity while their accessory
+         gadget settles. Keep the session alive and accept the next attach
+         instead of failing the app immediately. This is bounded so a truly
+         disconnected phone still times out normally.
+         */
+        if (detachState == USB_OPENING_BULK &&
+            g_accessoryDetachCount < AA_ACCESSORY_DETACH_MAX_RETRIES) {
+            ++g_accessoryDetachCount;
+            ksceDebugPrintf(
+                "[VitaAutoUSB] Accessory detach during setup; retry=%d\n",
+                g_accessoryDetachCount
+            );
+            __sync_lock_test_and_set(&g_accessoryControlPipe, -1);
+            __sync_lock_test_and_set(&g_usb.bulkInPipe, -1);
+            __sync_lock_test_and_set(&g_usb.bulkOutPipe, -1);
+            g_accessoryDeviceId = -1;
+            g_usb.deviceId = -1;
+            g_waitingForAccessory = 1;
+            g_accessorySetupPending = 0;
+            g_accessorySetupPolls = 0;
+            g_accessoryConfigPending = 0;
+            g_accessoryConfigured = 0;
+            g_accessoryConfigRetryCount = 0;
+            g_accessoryConfigRetryPolls = 0;
+            g_accessoryConfigRetryPending = 0;
+            g_versionSettlePolls = 0;
+            g_versionWriteCompleted = 0;
+            g_versionRetryCount = 0;
+            g_usb.state = USB_WAITING_FOR_ACCESSORY;
+            return SCE_USBD_DETACH_SUCCEEDED;
         }
+
         retireSession(USB_IDLE);
         __sync_lock_test_and_set(&g_accessoryControlPipe, -1);
         __sync_lock_test_and_set(&g_usb.bulkInPipe, -1);
@@ -456,17 +711,29 @@ static void resetSession(void)
     g_versionSettlePolls = 0;
     g_versionWriteCompleted = 0;
     g_versionRetryCount = 0;
-    g_protocolRequestPending = 0;
-    g_protocolSettlePolls = 0;
-    g_protocolRetryCount = 0;
-    g_staleAccessory = 0;
+    g_aoaRetryCount = 0;
+    g_aoaRetryPolls = 0;
+    g_aoaRetryPending = 0;
+    g_aoaRetryState = 0;
+    g_aoaRetryStringIndex = 0;
+    g_normalSetupPending = 0;
+    g_normalSetupPolls = 0;
+    g_earlyDetachCount = 0;
+    g_accessorySetupPending = 0;
+    g_accessorySetupPolls = 0;
     g_accessoryConfigPending = 0;
     g_accessoryConfigured = 0;
+    g_accessoryDetachCount = 0;
+    g_accessoryConfigRetryCount = 0;
+    g_accessoryConfigRetryPolls = 0;
+    g_accessoryConfigRetryPending = 0;
     g_bulkEndpointPacketSize = USB_BULK_MAX_PACKET_SIZE;
     g_lastVidPid = 0;
     g_lastFailureStage = VITA_AUTO_USB_FAILURE_NONE;
     g_lastFailureResult = 0;
     g_lastFailureCount = 0;
+    g_hostModeRestoreCount = 0;
+    g_hostModeRestoreCooldown = 0;
     resetBulkTransfers();
     ksceKernelClearEventFlag(g_readEvent, 0);
 }
@@ -474,6 +741,18 @@ static void resetSession(void)
 static int stopSession(void)
 {
     int result;
+    /*
+     A device detach retires the pipes without completing their queued URBs.
+     USBD never invokes those completions, so waiting for them can only time
+     out and strand the session until a reboot. The device is gone: close the
+     handles and release the accounting instead of draining callbacks that
+     will never arrive. A late completion is handled by the saturating
+     releasePendingTransfer() helper.
+     */
+    const int detached =
+        g_lastFailureStage == VITA_AUTO_USB_FAILURE_DETACH;
+    const int strandedTransfers = __sync_fetch_and_add(&g_pendingTransfers, 0);
+
     retireSession(USB_IDLE);
 
     // No callback can start new work after admission closes.
@@ -485,7 +764,7 @@ static int stopSession(void)
     }
     // Closing a pipe can strand requests without completing their callbacks.
     // Normal disconnect drains reads while AA is still responding, before Stop.
-    if (waitForSessionUsers(1) < 0) {
+    if (!detached && waitForSessionUsers(1) < 0) {
         g_lastFailureStage = VITA_AUTO_USB_FAILURE_STOP_TRANSFERS;
         g_lastFailureResult = -1;
         g_lastFailureCount = g_pendingTransfers;
@@ -517,11 +796,23 @@ static int stopSession(void)
         g_driverRegistered = 0;
     }
     // Keep the USB role and request storage intact until callbacks drain.
-    if (waitForSessionUsers(1) < 0) {
+    if (!detached && waitForSessionUsers(1) < 0) {
         g_lastFailureStage = VITA_AUTO_USB_FAILURE_STOP_TRANSFERS;
         g_lastFailureResult = -1;
         g_lastFailureCount = g_pendingTransfers;
         return -1;
+    }
+    if (detached && strandedTransfers > 0) {
+        /*
+         Unregister is complete, so no new transfer can be queued. Clear the
+         requests the detach orphaned; otherwise the next Start inherits a
+         counter that can never reach zero.
+         */
+        __sync_lock_test_and_set(&g_pendingTransfers, 0);
+        ksceDebugPrintf(
+            "[VitaAutoUSB] Detach recovery released %d stranded transfers\n",
+            strandedTransfers
+        );
     }
     if (g_bulkShared != NULL) {
         g_bulkShared->readArmed = 0;
@@ -536,16 +827,6 @@ static int stopSession(void)
             return result;
         }
         g_hostModeChanged = 0;
-    }
-    if (g_accessoryActivated) {
-        result = ksceUsbServAccessoryDeactivate();
-        if (result < 0) {
-            g_lastFailureStage = VITA_AUTO_USB_FAILURE_STOP_ACCESSORY;
-            g_lastFailureResult = result;
-            g_lastFailureCount = 0;
-            return result;
-        }
-        g_accessoryActivated = 0;
     }
     return 0;
 }

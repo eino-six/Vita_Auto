@@ -49,9 +49,28 @@ Diagnostics/wake remain available after Stop, until module unload begins. */
 #define AA_VERSION_MAX_RETRIES    8
 #define AA_VERSION_RETRY_POLLS    10
 #define AA_CONFIG_SETTLE_POLLS    3
-#define USB_PROTOCOL_MAX_RETRIES  6
-#define USB_PROTOCOL_SETTLE_POLLS 3
-#define USB_PROTOCOL_RETRY_POLLS  5
+/* Run accessory setup on the first GetState poll after 18d1 attaches. The
+   phone is already enumerated at this point; delaying only widens the window
+   in which it can drop the accessory gadget before SET_CONFIGURATION. */
+#define AA_ACCESSORY_SETUP_POLLS  0
+/* A phone can drop the accessory identity during its gadget handoff. Keep
+   the session open and let it re-enumerate instead of failing the app. */
+#define AA_ACCESSORY_DETACH_MAX_RETRIES 8
+/* SET_CONFIGURATION can be aborted with the same transient USBD error while
+   the accessory gadget is still settling. Retry it on the same device. */
+#define AA_CONFIG_MAX_RETRIES     8
+#define AA_CONFIG_RETRY_POLLS     5
+/* The normal MTP identity also needs a settle window before the first AOA
+   control request. Sending GET_PROTOCOL inside the attach callback can make
+   the phone reset while its MTP gadget is still initializing. */
+#define AA_NORMAL_SETUP_POLLS     5
+/* A phone that drops before AOA START may re-enumerate after a power or
+   cable reset. Keep the session open and let it retry instead of retiring. */
+#define AA_EARLY_DETACH_MAX_RETRIES 8
+/* A phone can interrupt an AOA control request while its gadget settles
+   after enumeration. Retry the request before failing the session. */
+#define AA_AOA_MAX_RETRIES   8
+#define AA_AOA_RETRY_POLLS   10
 /*
  Vita's host controller reliably completes endpoint-sized bulk reads. AA
  and TLS are byte streams, so larger records are reassembled above this
@@ -62,6 +81,10 @@ Diagnostics/wake remain available after Stop, until module unload begins. */
 #define AA_BULK_READ_PIPELINE_DEPTH 4
 #define AA_BULK_READ_RING_BYTES   (AA_BULK_READ_SLOT_SIZE * AA_BULK_READ_SLOT_COUNT)
 #define AA_BULK_READ_DMA_BYTES    (AA_BULK_READ_SLOT_SIZE * AA_BULK_READ_PIPELINE_DEPTH)
+/* A bulk IN transfer can fail with a transient controller error while the
+   phone is still alive. Skip that request, keep the session, and let the
+   scheduler submit a replacement. Persistent failures still retire. */
+#define AA_BULK_READ_MAX_TRANSIENT 16
 #define USB_EVENT_RX               0x01
 #define USB_EVENT_USER_WAKE        0x02
 
@@ -137,7 +160,8 @@ enum BulkReadRequestState {
     BULK_READ_FREE = 0,
     BULK_READ_SUBMITTING,
     BULK_READ_ACTIVE,
-    BULK_READ_COMPLETE
+    BULK_READ_COMPLETE,
+    BULK_READ_SKIPPED
 };
 
 typedef struct BulkReadRequest {
@@ -178,6 +202,7 @@ static volatile int g_bulkReadSchedulerBusy;
 static volatile int g_bulkReadSchedulerPending;
 static volatile int g_bulkReadsDraining;
 static volatile int g_bulkReadConcurrencyLimit = AA_BULK_READ_PIPELINE_DEPTH;
+static volatile int g_bulkReadTransientFailures;
 static unsigned char g_controlBuffer[256]
     __attribute__((aligned(64)));
 // Control channel, complete frame, six-byte payload: VERSION_REQUEST, 1.7.
@@ -200,27 +225,96 @@ static volatile int g_waitingForAccessory;
 static volatile int g_versionSettlePolls;
 static volatile int g_versionWriteCompleted;
 static volatile int g_versionRetryCount;
-static volatile int g_protocolRequestPending;
-static volatile int g_protocolSettlePolls;
-static volatile int g_protocolRetryCount;
-static volatile int g_staleAccessory;
+static volatile int g_aoaRetryCount;
+static volatile int g_aoaRetryPolls;
+static volatile int g_aoaRetryPending;
+static volatile int g_aoaRetryState;
+static volatile int g_aoaRetryStringIndex;
+static volatile int g_normalSetupPending;
+static volatile int g_normalSetupPolls;
+static volatile int g_earlyDetachCount;
+static volatile int g_accessorySetupPending;
+static volatile int g_accessorySetupPolls;
 static volatile int g_accessoryConfigPending;
 static volatile int g_accessoryConfigured;
+static volatile int g_accessoryDetachCount;
+static volatile int g_accessoryConfigRetryCount;
+static volatile int g_accessoryConfigRetryPolls;
+static volatile int g_accessoryConfigRetryPending;
 static SceUID g_accessoryControlPipe = -1;
 static volatile uint32_t g_operationGate = USB_IO_CLOSED | USB_ALL_CLOSED;
 static volatile int g_pendingTransfers;
 static volatile int g_lifecycleBusy;
 static volatile enum UsbState g_retiredState = USB_IDLE;
 static int g_driverRegistered;
-static int g_accessoryActivated;
 static int g_hostModeChanged;
 static int g_previousHostMode = USB_DEVICE_MODE;
-static volatile int g_hostModeResumePending;
-static int g_sysEventRegistered;
+static SceUID g_sysEventHandle = -1;
+static volatile int g_hostModeRestoreCount;
+static volatile int g_hostModeRestoreCooldown;
 
 static int sessionIsOpen(void)
 {
     return (__sync_fetch_and_add(&g_operationGate, 0) & USB_IO_CLOSED) == 0;
+}
+
+/*
+ The Vita's multi-use port can fall back to client mode after resume or a
+ cable/power event. If that happens the phone sees VBUS and may still show its
+ MTP notification, but the Vita is no longer hosting and no device appears in
+ the USBD callbacks. Reassert host mode while a session is open.
+ */
+static void ensureUsbHostMode(void)
+{
+    int mode;
+    int result;
+
+    if (!sessionIsOpen())
+        return;
+    /*
+     Never touch the port while a device is attached or enumerating. A
+     MacSelect in the middle of the AOA accessory handoff resets the port and
+     manifests as a detach at state 5. Only restore host mode when there is no
+     device and the session is waiting for one.
+     */
+    if (g_normalDeviceId >= 0 || g_accessoryDeviceId >= 0)
+        return;
+    if (g_usb.state != USB_IDLE && g_usb.state != USB_WAITING_FOR_ACCESSORY)
+        return;
+    if (g_hostModeRestoreCooldown > 0) {
+        --g_hostModeRestoreCooldown;
+        return;
+    }
+
+    mode = ksceUsbServMacGet(USB_HOST_PORT);
+    if (mode != USB_DEVICE_MODE)
+        return;
+
+    /* Do not hammer the port if the hardware refuses to stay in host mode. */
+    g_hostModeRestoreCooldown = 10;
+    result = ksceUsbServMacSelect(USB_HOST_PORT, USB_HOST_MODE);
+    g_hostModeResult = result;
+    g_hostModeChanged = 1;
+    if (g_hostModeRestoreCount < 8) {
+        ksceDebugPrintf(
+            "[VitaAutoUSB] Host mode reset to client; restore result=0x%08x count=%d\n",
+            result,
+            g_hostModeRestoreCount + 1
+        );
+    }
+    if (g_hostModeRestoreCount < 0x7fffffff)
+        ++g_hostModeRestoreCount;
+}
+
+static int hostModeSysEventHandler(
+    int resume, int eventId, void *eventParam, void *args)
+{
+    (void)eventId;
+    (void)eventParam;
+    (void)args;
+    if (resume)
+        ensureUsbHostMode();
+    return 0;
 }
 
 // Never hold a lock across an SDK call: USBD can complete a transfer inline.

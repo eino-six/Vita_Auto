@@ -40,9 +40,10 @@ enum VitaAutoUsbFailureStage {
     VITA_AUTO_USB_FAILURE_STOP_TRANSFERS = 25,
     VITA_AUTO_USB_FAILURE_STOP_HOST_MODE = 26,
     VITA_AUTO_USB_FAILURE_STOP_ACCESSORY = 27,
-    VITA_AUTO_USB_FAILURE_RESUME_HOST_MODE = 28,
-    VITA_AUTO_USB_FAILURE_STALE_ACCESSORY = 29,
-    VITA_AUTO_USB_FAILURE_DETACHED = 30
+    /* Diagnostic: the accessory detached while a session was active. The
+       result is a synthetic device-not-found code because the USBD detach
+       callback does not carry one. */
+    VITA_AUTO_USB_FAILURE_DETACH = 28
 };
 
 /*
@@ -124,7 +125,7 @@ unsigned int vitaAutoUsbGetLastVidPid(void);
 int vitaAutoUsbGetLastFailureStage(void);
 int vitaAutoUsbGetLastFailureResult(void);
 int vitaAutoUsbGetLastFailureCount(void);
-/* Start acquires the accessory port/host role and registers the USB driver.
+/* Start acquires the host role on the multi-use port and registers the USB driver.
  Repeated Start is a no op. A retired session is drained before starting again.
  Return zero or a error. */
 int vitaAutoUsbStart(void);

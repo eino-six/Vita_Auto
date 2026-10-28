@@ -104,6 +104,7 @@ static void resetBulkTransfers(void)
     g_bulkReadSchedulerPending = 0;
     g_bulkReadsDraining = 0;
     g_bulkReadConcurrencyLimit = AA_BULK_READ_PIPELINE_DEPTH;
+    g_bulkReadTransientFailures = 0;
     g_bulkShared->readArmed = 0;
     for (i = 0; i < AA_BULK_READ_PIPELINE_DEPTH; ++i) {
         g_bulkReadRequests[i].state = BULK_READ_FREE;
@@ -165,6 +166,20 @@ static void handleAccessoryConfigurationDone(int32_t result, int32_t count, void
 static void handleAaBulkReadDone(int32_t result, int32_t count, void *arg);
 static void handleAaBulkWriteDone(int32_t result, int32_t count, void *arg);
 
+/* A detach can retire a pipe without completing its queued URBs. Stop clears
+   the accounting for those stranded requests, so a late completion from the
+   old session must not underflow the counter used by the next session. */
+static void releasePendingTransfer(void)
+{
+    int current;
+    do {
+        current = __sync_fetch_and_add(&g_pendingTransfers, 0);
+        if (current <= 0)
+            return;
+    } while (!__sync_bool_compare_and_swap(
+        &g_pendingTransfers, current, current - 1));
+}
+
 static void completeTransfer(
     ksceUsbdDoneCallback callback, int32_t result, int32_t count, void *arg)
 {
@@ -172,7 +187,7 @@ static void completeTransfer(
         callback(result, count, arg);
         leaveOperation();
     }
-    __sync_sub_and_fetch(&g_pendingTransfers, 1);
+    releasePendingTransfer();
 }
 
 static void usbTransferDone(int32_t result, int32_t count, void *arg)
@@ -181,7 +196,7 @@ static void usbTransferDone(int32_t result, int32_t count, void *arg)
     if (g_normalDeviceId >= 0 && g_accessoryDeviceId < 0)
         completeTransfer(handleUsbTransferDone, result, count, arg);
     else
-        __sync_sub_and_fetch(&g_pendingTransfers, 1);
+        releasePendingTransfer();
 }
 
 static void accessoryConfigurationDone(int32_t result, int32_t count, void *arg)
@@ -209,7 +224,7 @@ static int queueControlTransfer(
     __sync_add_and_fetch(&g_pendingTransfers, 1);
     result = ksceUsbdControlTransfer(pipe, request, buffer, callback, arg);
     if (result < 0)
-        __sync_sub_and_fetch(&g_pendingTransfers, 1);
+        releasePendingTransfer();
     return result;
 }
 
@@ -223,7 +238,7 @@ static int queueBulkTransfer(
     __sync_add_and_fetch(&g_pendingTransfers, 1);
     result = ksceUsbdBulkTransfer(pipe, buffer, length, callback, arg);
     if (result < 0)
-        __sync_sub_and_fetch(&g_pendingTransfers, 1);
+        releasePendingTransfer();
     return result;
 }
 
@@ -251,6 +266,19 @@ static int submitControlRequest(
     );
 }
 
+static int submitStart(void)
+{
+    g_usb.state = USB_STARTING;
+    return submitControlRequest(
+        USB_REQ_TO_DEVICE_VENDOR,
+        USB_START,
+        0,
+        0,
+        0,
+        NULL
+    );
+}
+
 static int submitNextString(void)
 {
     static const char *const strings[] = {
@@ -265,17 +293,8 @@ static int submitNextString(void)
     const char *value;
     unsigned int length = 0;
 
-    if (g_usb.stringIndex >= (sizeof(strings) / sizeof(strings[0]))) {
-        g_usb.state = USB_STARTING;
-        return submitControlRequest(
-            USB_REQ_TO_DEVICE_VENDOR,
-            USB_START,
-            0,
-            0,
-            0,
-            NULL
-        );
-    }
+    if (g_usb.stringIndex >= (sizeof(strings) / sizeof(strings[0])))
+        return submitStart();
 
     value = strings[g_usb.stringIndex];
 
@@ -306,30 +325,88 @@ static void handleUsbTransferDone(int32_t result, int32_t count, void *arg)
     (void)arg;
 
     if (result < 0) {
-        const int gettingProtocol = g_usb.state == USB_GETTING_PROTOCOL;
+        /*
+         A control completion can arrive after the accessory has already
+         attached, or after the normal device detached while START was in
+         flight. Its old normal-device pipe is irrelevant then; do not turn
+         it into a session failure.
+         */
+        if (g_accessoryDeviceId >= 0 ||
+            g_usb.state == USB_IDLE ||
+            g_usb.state == USB_WAITING_FOR_ACCESSORY)
+            return;
 
-        ksceDebugPrintf(
-            "[VitaAutoUSB] USB request failed: 0x%08x state=%d attempt=%d\n",
-            result,
-            (int)g_usb.state,
-            g_protocolRetryCount
-        );
-        if (gettingProtocol &&
-            result == (int)SCE_USBD_ERROR_8024000A &&
-            g_protocolRetryCount < USB_PROTOCOL_MAX_RETRIES)
-        {
-            ++g_protocolRetryCount;
-            g_protocolSettlePolls = USB_PROTOCOL_RETRY_POLLS;
-            __sync_synchronize();
-            g_protocolRequestPending = 1;
+        /*
+         The phone may abort the START control transfer as it switches to
+         accessory mode. Set the waiting flag before retrying so an accessory
+         that re-enumerates during a retry is accepted instead of rejected.
+         START is special: the abort can be the switch itself, not a request
+         that needs to be sent again.
+         */
+        if (g_usb.state == USB_STARTING &&
+            result == (int)SCE_USBD_ERROR_8024000A) {
+            g_waitingForAccessory = 1;
+            if (g_aoaRetryCount < AA_AOA_MAX_RETRIES) {
+                ++g_aoaRetryCount;
+                g_aoaRetryPolls = AA_AOA_RETRY_POLLS;
+                g_aoaRetryPending = 1;
+                g_aoaRetryState = USB_STARTING;
+                ksceDebugPrintf(
+                    "[VitaAutoUSB] START interrupted; waiting for accessory retry=%d\n",
+                    g_aoaRetryCount
+                );
+                return;
+            }
+            g_aoaRetryPending = 0;
+            g_aoaRetryCount = 0;
+            g_usb.state = USB_WAITING_FOR_ACCESSORY;
+            ksceDebugPrintf(
+                "[VitaAutoUSB] START retries exhausted; waiting for accessory\n"
+            );
             return;
         }
-        // For GET_PROTOCOL the count reports how many retries were spent
-        setUsbFailure(
-            VITA_AUTO_USB_FAILURE_CONTROL_TRANSFER,
-            result,
-            gettingProtocol ? g_protocolRetryCount : count
-        );
+
+        /*
+         The phone can interrupt any AOA control request while its gadget
+         settles after enumeration. Retry GET_PROTOCOL, SEND_STRING, and START
+         with the same transient policy used for AA version bulk writes.
+         */
+        if ((g_usb.state == USB_GETTING_PROTOCOL ||
+             g_usb.state == USB_SENDING_STRINGS ||
+             g_usb.state == USB_STARTING) &&
+            result == (int)SCE_USBD_ERROR_8024000A &&
+            g_aoaRetryCount < AA_AOA_MAX_RETRIES) {
+            ++g_aoaRetryCount;
+            g_aoaRetryPolls = AA_AOA_RETRY_POLLS;
+            g_aoaRetryPending = 1;
+            g_aoaRetryState = g_usb.state;
+            g_aoaRetryStringIndex = g_usb.stringIndex;
+            ksceDebugPrintf(
+                "[VitaAutoUSB] AOA request interrupted; state=%d index=%u retry=%d\n",
+                g_usb.state,
+                g_usb.stringIndex,
+                g_aoaRetryCount
+            );
+            return;
+        }
+
+        ksceDebugPrintf("[VitaAutoUSB] USB request failed: 0x%08x\n", result);
+        {
+            int failureCount = count;
+
+            if (g_usb.state == USB_GETTING_PROTOCOL)
+                failureCount = g_aoaRetryCount;
+            else if (g_usb.state == USB_SENDING_STRINGS)
+                failureCount = 0x100 | (int)(g_usb.stringIndex & 0xffu);
+            else if (g_usb.state == USB_STARTING)
+                failureCount = 0x200 | (g_aoaRetryCount & 0xff);
+
+            setUsbFailure(
+                VITA_AUTO_USB_FAILURE_CONTROL_TRANSFER,
+                result,
+                failureCount
+            );
+        }
         return;
     }
 
@@ -353,6 +430,7 @@ static void handleUsbTransferDone(int32_t result, int32_t count, void *arg)
         vitaUsbLogInfo("[VitaAutoUSB] USB protocol %u detected\n", protocolVersion);
         g_usb.state = USB_SENDING_STRINGS;
         g_usb.stringIndex = 0;
+        g_aoaRetryCount = 0;
 
         {
             const int submitResult = submitNextString();
@@ -364,6 +442,7 @@ static void handleUsbTransferDone(int32_t result, int32_t count, void *arg)
 
     if (g_usb.state == USB_SENDING_STRINGS) {
         ++g_usb.stringIndex;
+        g_aoaRetryCount = 0;
 
         {
             const int submitResult = submitNextString();
@@ -378,6 +457,7 @@ static void handleUsbTransferDone(int32_t result, int32_t count, void *arg)
         vitaUsbLogInfo("[VitaAutoUSB] USB start sent; waiting for phone re-enumeration\n");
         g_waitingForAccessory = 1;
         g_usb.state = USB_WAITING_FOR_ACCESSORY;
+        g_aoaRetryCount = 0;
     }
 }
 
@@ -420,13 +500,7 @@ static void handleAaBulkWriteDone(int32_t result, int32_t count, void *arg)
             result,
             count
         );
-        setUsbFailure(
-            g_staleAccessory && g_usb.state == USB_AA_VERSION_SENT
-                ? VITA_AUTO_USB_FAILURE_STALE_ACCESSORY
-                : VITA_AUTO_USB_FAILURE_BULK_WRITE,
-            result,
-            count
-        );
+        setUsbFailure(VITA_AUTO_USB_FAILURE_BULK_WRITE, result, count);
         return;
     }
 
@@ -457,11 +531,69 @@ static void handleAaBulkReadDone(int32_t result, int32_t count, void *arg)
         __sync_sub_and_fetch(&g_bulkShared->readArmed, 1);
 
     if (result < 0) {
+        ksceDebugPrintf(
+            "[VitaAutoUSB] AA bulk read failed: 0x%08x count=%d state=%d armed=%d submit=%u complete=%u\n",
+            (unsigned int)result,
+            count,
+            g_usb.state,
+            g_bulkShared->readArmed,
+            g_bulkShared->readSubmitCount,
+            g_bulkShared->readCompleteCount
+        );
+
+        /*
+         0x8024000A is the transient controller error already tolerated for
+         AOA control requests. The controller can report it after it has
+         already moved bytes; the v10 build retired that request as SKIPPED
+         and dropped the bytes, leaving a hole in the AA byte stream. TLS
+         then failed with INVALID_MAC on a record whose sequence number was
+         correct, or the outer AA parser lost framing, depending on where the
+         hole landed. Publish what the controller reports, exactly like a
+         short read, so the stream stays contiguous.
+        */
+        if (result == (int)SCE_USBD_ERROR_8024000A &&
+            count > 0 &&
+            count <= AA_BULK_READ_SLOT_SIZE &&
+            g_usb.state == USB_AA_VERSION_COMPLETE &&
+            g_bulkReadTransientFailures < AA_BULK_READ_MAX_TRANSIENT &&
+            sessionIsOpen()) {
+            ++g_bulkReadTransientFailures;
+            ++g_bulkShared->readChecksumFailures;
+            ksceDebugPrintf(
+                "[VitaAutoUSB] AA bulk read partial: 0x%08x kept=%d submit=%u complete=%u\n",
+                (unsigned int)result,
+                count,
+                g_bulkShared->readSubmitCount,
+                g_bulkShared->readCompleteCount
+            );
+            completeBulkReadRequest(request, count);
+            submitBulkRead();
+            return;
+        }
+
+        /*
+         Only a zero-byte abort can be dropped without losing stream bytes.
+         Keep this path for the version handshake and for persistent errors;
+         a persistent error still retires the session so the app can show the
+         reconnect screen.
+        */
+        if (result == (int)SCE_USBD_ERROR_8024000A &&
+            g_bulkReadTransientFailures < AA_BULK_READ_MAX_TRANSIENT &&
+            sessionIsOpen()) {
+            ++g_bulkReadTransientFailures;
+            ++g_bulkShared->readSequenceFailures;
+            request->state = BULK_READ_SKIPPED;
+            wakeReader();
+            submitBulkRead();
+            return;
+        }
+
         request->state = BULK_READ_FREE;
-        ksceDebugPrintf("[VitaAutoUSB] AA bulk read failed: 0x%08x\n", result);
         setUsbFailure(VITA_AUTO_USB_FAILURE_BULK_READ, result, count);
         return;
     }
+
+    g_bulkReadTransientFailures = 0;
 
     if (count > AA_BULK_READ_SLOT_SIZE) {
         request->state = BULK_READ_FREE;
@@ -488,9 +620,21 @@ static void handleAaBulkReadDone(int32_t result, int32_t count, void *arg)
                 request->buffer[AA_VERSION_RESPONSE_MINOR_LOW]
         );
         g_usb.state = USB_AA_VERSION_COMPLETE;
-        /* The version response is consumed by the kernel; keep its sequence
-         position so later pipelined TLS packets publish in strict order. */
-        completeBulkReadRequest(request, 0);
+        /*
+         The version response is consumed by the kernel. A single USB bulk
+         transfer can contain additional AA frames after the 12-byte version
+         response; preserve those bytes instead of discarding the whole
+         transfer, otherwise the app can start TLS in the middle of a frame.
+        */
+        if (count > AA_VERSION_RESPONSE_SIZE) {
+            const int remaining = count - AA_VERSION_RESPONSE_SIZE;
+            for (int index = 0; index < remaining; ++index)
+                request->buffer[index] =
+                    request->buffer[AA_VERSION_RESPONSE_SIZE + index];
+            completeBulkReadRequest(request, remaining);
+        } else {
+            completeBulkReadRequest(request, 0);
+        }
         submitBulkRead();
         return;
     }
@@ -515,21 +659,42 @@ static int publishCompletedBulkReads(void)
     int requestIndex;
     BulkReadRequest *request = NULL;
 
-    for (requestIndex = 0;
-         requestIndex < AA_BULK_READ_PIPELINE_DEPTH;
-         ++requestIndex)
-    {
-        if (g_bulkReadRequests[requestIndex].state == BULK_READ_COMPLETE &&
-            g_bulkReadRequests[requestIndex].submitSequence ==
-                g_bulkReadPublishSequence)
+    /*
+     A transient read failure leaves a SKIPPED request in submission order.
+     Consume it when it reaches the publish sequence so later completed reads
+     are not blocked by a packet that will never arrive.
+    */
+    for (;;) {
+        request = NULL;
+        for (requestIndex = 0;
+             requestIndex < AA_BULK_READ_PIPELINE_DEPTH;
+             ++requestIndex)
         {
-            request = &g_bulkReadRequests[requestIndex];
-            break;
+            BulkReadRequest *candidate = &g_bulkReadRequests[requestIndex];
+            if (candidate->state != BULK_READ_FREE &&
+                candidate->submitSequence == g_bulkReadPublishSequence)
+            {
+                request = candidate;
+                break;
+            }
         }
-    }
 
-    if (request == NULL)
+        if (request == NULL)
+            return 0;
+
+        if (request->state == BULK_READ_SKIPPED) {
+            request->submitSequence = 0;
+            __sync_synchronize();
+            request->state = BULK_READ_FREE;
+            ++g_bulkReadPublishSequence;
+            return 1;
+        }
+
+        if (request->state == BULK_READ_COMPLETE)
+            break;
+
         return 0;
+    }
 
     __sync_synchronize();
     if (request->length > 0) {
@@ -644,10 +809,20 @@ static int submitBulkRead(void)
                 __sync_add_and_fetch(&g_bulkShared->readArmed, 1);
                 ++g_bulkShared->readSubmitCount;
 
+                /*
+                 Submit a full ring slot (4096 bytes), not one endpoint packet.
+                 wMaxPacketSize is the hardware packet size, not a transfer
+                 size: using it queued one 512-byte URB per packet, so the
+                 32-slot ring only ever held 16 KB of stream and the
+                 scheduler spent most of the session stalled on ring space
+                 (observed depth 20-31 of 32). Each URB also costs a callback
+                 and a reader wake, which is what pushed the app behind in the
+                 first place.
+                */
                 submitResult = queueBulkTransfer(
                     g_usb.bulkInPipe,
                     request->buffer,
-                    g_bulkEndpointPacketSize,
+                    AA_BULK_READ_SLOT_SIZE,
                     aaBulkReadDone,
                     request
                 );

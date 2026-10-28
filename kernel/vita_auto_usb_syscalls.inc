@@ -1,32 +1,5 @@
 int _start(SceSize argc, const void *args) __attribute__((weak, alias("module_start")));
 
-static int usbSysEventHandler(int resume, int eventid, void *args, void *opt)
-{
-    (void)eventid;
-    (void)args;
-    (void)opt;
-    if (resume)
-        __sync_lock_test_and_set(&g_hostModeResumePending, 1);
-    return 0;
-}
-
-static void restoreHostModeAfterResume(void)
-{
-    int result;
-    if (!__sync_lock_test_and_set(&g_hostModeResumePending, 0))
-        return;
-    if (!sessionIsOpen() || ksceUsbServMacGet(USB_HOST_PORT) == USB_HOST_MODE)
-        return;
-
-    result = ksceUsbServMacSelect(USB_HOST_PORT, USB_HOST_MODE);
-    if (result < 0) {
-        setUsbFailure(VITA_AUTO_USB_FAILURE_RESUME_HOST_MODE, result, 0);
-        return;
-    }
-    g_hostModeChanged = 1;
-    vitaUsbLogInfo("[VitaAutoUSB] Host mode restored after resume\n");
-}
-
 int module_start(SceSize argc, const void *args)
 {
     int result;
@@ -47,11 +20,16 @@ int module_start(SceSize argc, const void *args)
     }
     resetSession();
     __sync_lock_test_and_set(&g_operationGate, USB_IO_CLOSED);
-    if (ksceKernelRegisterSysEventHandler(
-            "vita_auto_usb", usbSysEventHandler, NULL) >= 0)
-        g_sysEventRegistered = 1;
-    else
-        ksceDebugPrintf("[VitaAutoUSB] Resume handler not registered\n");
+    g_sysEventHandle = ksceKernelRegisterSysEventHandler(
+        "vita_auto_usb_host", hostModeSysEventHandler, NULL);
+    if (g_sysEventHandle < 0) {
+        ksceDebugPrintf(
+            "[VitaAutoUSB] Host mode sysevent registration failed: 0x%08x\n",
+            g_sysEventHandle
+        );
+        g_sysEventHandle = -1;
+    }
+    ksceDebugPrintf("[VitaAutoUSB] RX diagnostic build 12 (4k reads) loaded\n");
     return SCE_KERNEL_START_SUCCESS;
 }
 
@@ -62,12 +40,12 @@ int module_stop(SceSize argc, const void *args)
     (void)args;
     if (!__sync_bool_compare_and_swap(&g_lifecycleBusy, 0, 1))
         return SCE_KERNEL_STOP_FAIL;
-    if (g_sysEventRegistered) {
-        __sync_lock_release(&g_lifecycleBusy);
-        return SCE_KERNEL_STOP_FAIL;
-    }
 
     // Also exclude diagnostics and wake calls before deleting their resources.
+    if (g_sysEventHandle >= 0) {
+        ksceKernelUnregisterSysEventHandler(g_sysEventHandle);
+        g_sysEventHandle = -1;
+    }
     __sync_fetch_and_or(&g_operationGate, USB_ALL_CLOSED | USB_IO_CLOSED);
     result = stopSession();
     if (result >= 0 && g_readEvent >= 0) {
@@ -120,13 +98,10 @@ static int usbStart(void)
         goto failed;
     g_driverRegistered = 1;
 
-    g_accessoryActivateResult = ksceUsbServAccessoryActivate();
-    if (g_accessoryActivateResult >= 0)
-        g_accessoryActivated = 1;
-    else
-        ksceDebugPrintf("[VitaAutoUSB] AccessoryActivate failed: 0x%08x\n",
-                        g_accessoryActivateResult);
-    g_hostModeResumePending = 0;
+    /* Do not activate the Vita 1000 accessory port. Host mode is selected on
+       the multi-use port (USB_HOST_PORT) below; the separate accessory/EHCI
+       port is not where the phone is connected. A reset to client mode after
+       Start is caught by ensureUsbHostMode() on the app's GetState poll. */
     if (g_previousHostMode != USB_HOST_MODE) {
         g_hostModeResult = ksceUsbServMacSelect(USB_HOST_PORT, USB_HOST_MODE);
         result = g_hostModeResult;
@@ -164,9 +139,9 @@ static int usbStop(void)
 static int usbGetState(void)
 {
     int state;
+    ensureUsbHostMode();
     if (!enterOperation(0))
         return g_retiredState;
-    restoreHostModeAfterResume();
     pumpAndroidAutoVersionHandshake();
     state = sessionIsOpen() ? g_usb.state : g_retiredState;
     leaveOperation();
@@ -365,22 +340,37 @@ static void waitForBulkReadEvent(uint32_t timeoutUs)
     );
 }
 
+/*
+ A retired session normally reads as -1. When retirement was caused by a USB
+ failure, return the actual negative USBD result instead so the app log can
+ distinguish a transient controller error from a detach or stop.
+*/
+static int readFailureResult(void)
+{
+    if ((g_usb.state == USB_FAILED ||
+         g_lastFailureStage == VITA_AUTO_USB_FAILURE_DETACH) &&
+        g_lastFailureResult < 0)
+        return g_lastFailureResult;
+    return -1;
+}
+
 /* Hold admission through the event wait: Stop wakes us and waits for us to
- leave before closing pipes. The second read sees retirement and returns -1. */
+ leave before closing pipes. The second read sees retirement and returns the
+ failure result (or -1 for a normal stop). */
 static int readBulkWait(
     void *userBuffer, uint32_t capacity, uint32_t timeoutUs,
     VitaAutoUsbReadMetadata *userMetadata)
 {
     int result;
     if (!enterOperation(0))
-        return -1;
+        return readFailureResult();
     result = readBulkTimed(userBuffer, capacity, userMetadata);
     if (result == 0 && timeoutUs != 0 && g_readEvent >= 0) {
         waitForBulkReadEvent(timeoutUs);
         result = readBulkTimed(userBuffer, capacity, userMetadata);
     }
     if (!sessionIsOpen())
-        result = -1;
+        result = readFailureResult();
     leaveOperation();
     return result;
 }
@@ -416,7 +406,7 @@ static int copyRxDiagnostics(VitaAutoUsbRxDiagnostics *userDiagnostics)
     diagnostics.completedTransfers = g_bulkShared->readCompleteCount;
     diagnostics.publishedPackets = g_bulkShared->readPublishedCount;
     diagnostics.consumedPackets = g_bulkShared->readConsumedCount;
-    diagnostics.overflowCount = 0; /* Retained ABI field; capacity is reserved. */
+    diagnostics.overflowCount = 0x1200u; /* v12 build tag */
     diagnostics.checksumFailures = g_bulkShared->readChecksumFailures;
     diagnostics.sequenceFailures = g_bulkShared->readSequenceFailures;
     diagnostics.maxRingDepth = g_bulkShared->readMaxDepth;
@@ -431,6 +421,19 @@ static int copyRxDiagnostics(VitaAutoUsbRxDiagnostics *userDiagnostics)
     diagnostics.writeBusy = (uint32_t)g_bulkShared->writeBusy;
     diagnostics.lastWriteResult = g_bulkShared->writeLastResult;
     diagnostics.lastWriteBytes = g_bulkShared->writeLastBytes;
+
+    /*
+     Diagnostic build only: the v0.1.0 app has no read-failure fields in its
+     RX diagnostic line. On a terminal failure, repurpose the three counters
+     that are zero at that point so the exact result/stage/count reach
+     vita_auto.log without replacing the VPK or client.
+    */
+    if (g_usb.state == USB_FAILED ||
+        g_lastFailureStage == VITA_AUTO_USB_FAILURE_DETACH) {
+        diagnostics.overflowCount = (uint32_t)g_lastFailureResult;
+        diagnostics.checksumFailures = (uint32_t)g_lastFailureStage;
+        diagnostics.sequenceFailures = (uint32_t)g_lastFailureCount;
+    }
 
     return ksceKernelMemcpyKernelToUser(
         userDiagnostics,
