@@ -160,10 +160,13 @@ void pollControllerInput(ButtonSender sender)
     constexpr uint8_t ANALOG_LOW = 64;
     constexpr uint8_t ANALOG_HIGH = 192;
 
+    // The right stick is the focus/key navigation path. D-pad up/down stay on
+    // the rotary path below because Android Auto lists (for example Spotify)
+    // scroll reliably with rotary events but can ignore plain D-pad key events.
     uint8_t focus = 0;
-    if ((pad.buttons & SCE_CTRL_UP) || pad.ry <= ANALOG_LOW)
+    if (pad.ry <= ANALOG_LOW)
         focus |= NAV_UP;
-    if ((pad.buttons & SCE_CTRL_DOWN) || pad.ry >= ANALOG_HIGH)
+    if (pad.ry >= ANALOG_HIGH)
         focus |= NAV_DOWN;
     if (pad.rx <= ANALOG_LOW)
         focus |= NAV_LEFT;
@@ -185,10 +188,12 @@ void pollControllerInput(ButtonSender sender)
         sender
     );
 
+    // D-pad and left stick both drive rotary list navigation. Holding a
+    // direction repeats the step after the initial delay.
     uint8_t items = 0;
-    if (pad.ly <= ANALOG_LOW)
+    if ((pad.buttons & SCE_CTRL_UP) || pad.ly <= ANALOG_LOW)
         items |= NAV_UP;
-    if (pad.ly >= ANALOG_HIGH)
+    if ((pad.buttons & SCE_CTRL_DOWN) || pad.ly >= ANALOG_HIGH)
         items |= NAV_DOWN;
     if ((pad.buttons & SCE_CTRL_LEFT) || pad.lx <= ANALOG_LOW)
         items |= NAV_LEFT;

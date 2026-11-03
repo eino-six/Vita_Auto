@@ -78,6 +78,18 @@ from `app0:vita_auto_usb_client.suprx`.
 - **Triangle** changes **Music + Nav: Vita / Phone** while disconnected or on a retry/error
   screen. Press **Cross** to connect with that choice. Changing it pauses automatic retries.
 
+### While connected
+
+- **D-pad** or **left stick** scrolls lists, including Spotify. Up/left moves
+  to the previous item and down/right moves to the next item. Hold a direction
+  to keep scrolling.
+- **Right stick** moves focus in screens that use focus navigation.
+- **Cross** selects and **Circle** goes back.
+- **Triangle** toggles play/pause.
+- **L** and **R** skip to the previous or next track.
+- **Square** starts voice assistant/search.
+- **Start + Select** disconnects.
+
 To change audio during a session, press **Start + Select**, wait for **Disconnected**,
 then press **Triangle** and **Cross**. Music and navigation follow the same setting.
 **Vita** is the default. **Phone** leaves their routing to Android, including its
