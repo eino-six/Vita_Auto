@@ -108,8 +108,106 @@ bool queueTouchEvent(const inputs::TouchEvent& touch)
     return queued;
 }
 
+constexpr uint64_t SYNTHETIC_SWIPE_STEP_US = 12000;
+constexpr uint64_t SYNTHETIC_SWIPE_REPEAT_GUARD_US = 200000;
+constexpr uint16_t SYNTHETIC_SWIPE_X = 640;
+constexpr uint16_t SYNTHETIC_SWIPE_TOP_Y = 260;
+constexpr uint16_t SYNTHETIC_SWIPE_BOTTOM_Y = 460;
+constexpr uint8_t SYNTHETIC_SWIPE_STEP_COUNT = 4;
+
+struct SyntheticSwipeState {
+    bool active = false;
+    bool scrollUp = false;
+    uint8_t step = 0;
+    uint64_t nextStepAtUs = 0;
+    uint64_t startedAtUs = 0;
+};
+
+static SyntheticSwipeState g_syntheticSwipe;
+
+bool isScrollCommand(inputs::ButtonCommand command)
+{
+    return command == inputs::ButtonCommand::ScrollUp ||
+           command == inputs::ButtonCommand::ScrollDown;
+}
+
+void startSyntheticSwipe(inputs::ButtonCommand command, bool repeated)
+{
+    if (g_syntheticSwipe.active)
+        return;
+
+    const uint64_t nowUs = performance::nowUs();
+    if (repeated &&
+        nowUs - g_syntheticSwipe.startedAtUs < SYNTHETIC_SWIPE_REPEAT_GUARD_US)
+        return;
+
+    g_syntheticSwipe.active = true;
+    g_syntheticSwipe.scrollUp = command == inputs::ButtonCommand::ScrollUp;
+    g_syntheticSwipe.step = 0;
+    g_syntheticSwipe.nextStepAtUs = nowUs;
+    g_syntheticSwipe.startedAtUs = nowUs;
+    vitaLog(
+        "direct-usb: synthetic swipe direction=%s",
+        g_syntheticSwipe.scrollUp ? "up" : "down"
+    );
+}
+
+void advanceSyntheticSwipe()
+{
+    if (!g_syntheticSwipe.active)
+        return;
+
+    const uint64_t nowUs = performance::nowUs();
+    if (nowUs < g_syntheticSwipe.nextStepAtUs)
+        return;
+
+    const uint16_t startY = g_syntheticSwipe.scrollUp
+        ? SYNTHETIC_SWIPE_TOP_Y
+        : SYNTHETIC_SWIPE_BOTTOM_Y;
+    const uint16_t endY = g_syntheticSwipe.scrollUp
+        ? SYNTHETIC_SWIPE_BOTTOM_Y
+        : SYNTHETIC_SWIPE_TOP_Y;
+
+    inputs::TouchEvent touch;
+    touch.x = SYNTHETIC_SWIPE_X;
+    switch (g_syntheticSwipe.step) {
+    case 0:
+        touch.action = inputs::TouchAction::Down;
+        touch.y = startY;
+        break;
+    case 1:
+        touch.action = inputs::TouchAction::Move;
+        touch.y = static_cast<uint16_t>((startY + endY) / 2);
+        break;
+    case 2:
+        touch.action = inputs::TouchAction::Move;
+        touch.y = endY;
+        break;
+    default:
+        touch.action = inputs::TouchAction::Up;
+        touch.y = endY;
+        break;
+    }
+
+    if (!queueTouchEvent(touch))
+        return;
+
+    ++g_syntheticSwipe.step;
+    if (g_syntheticSwipe.step >= SYNTHETIC_SWIPE_STEP_COUNT) {
+        g_syntheticSwipe.active = false;
+        return;
+    }
+    g_syntheticSwipe.nextStepAtUs = nowUs + SYNTHETIC_SWIPE_STEP_US;
+}
+
 bool queueButtonEvent(const inputs::ButtonEvent& button)
 {
+    if (isScrollCommand(button.command)) {
+        if (button.pressed)
+            startSyntheticSwipe(button.command, button.repeated);
+        return true;
+    }
+
     // Rotary releases only update the controller's local held-button state.
     if (isRotaryCommand(button.command) && !button.pressed)
         return true;
@@ -135,6 +233,7 @@ bool sampleDirectInput()
 
     pollTouchInput(queueTouchEvent);
     pollControllerInput(queueButtonEvent);
+    advanceSyntheticSwipe();
     return true;
 }
 
@@ -331,6 +430,7 @@ void init()
     g_directInputQueue.reset();
     g_deliveryStats = {};
     g_inputSequence = 0;
+    g_syntheticSwipe = {};
     setReady(false);
 }
 

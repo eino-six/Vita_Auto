@@ -24,6 +24,8 @@ enum class ButtonCommand : uint8_t {
     VoiceAssistant = 11,
     PreviousItem = 12,
     NextItem = 13,
+    ScrollUp = 14,
+    ScrollDown = 15,
 };
 
 struct TouchEvent {

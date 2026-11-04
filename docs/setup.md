@@ -80,9 +80,9 @@ from `app0:vita_auto_usb_client.suprx`.
 
 ### While connected
 
-- **D-pad** or **left stick** scrolls lists, including Spotify. Up/left moves
-  to the previous item and down/right moves to the next item. Hold a direction
-  to keep scrolling.
+- **D-pad** or **left stick** navigates lists, including Spotify. Left/right
+  moves between items. Up/down scrolls the list vertically. Hold a direction
+  to keep moving.
 - **Right stick** moves focus in screens that use focus navigation.
 - **Cross** selects and **Circle** goes back.
 - **Triangle** toggles play/pause.

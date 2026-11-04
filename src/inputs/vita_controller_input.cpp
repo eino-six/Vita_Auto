@@ -160,9 +160,11 @@ void pollControllerInput(ButtonSender sender)
     constexpr uint8_t ANALOG_LOW = 64;
     constexpr uint8_t ANALOG_HIGH = 192;
 
-    // The right stick is the focus/key navigation path. D-pad up/down stay on
-    // the rotary path below because Android Auto lists (for example Spotify)
-    // scroll reliably with rotary events but can ignore plain D-pad key events.
+    // The right stick is the focus/key navigation path. The D-pad and left
+    // stick use the item paths below: horizontal movement goes through rotary,
+    // while vertical movement is sent as a swipe by the input queue because
+    // Spotify ignores plain D-pad up/down key events and treats rotary as
+    // horizontal movement.
     uint8_t focus = 0;
     if (pad.ry <= ANALOG_LOW)
         focus |= NAV_UP;
@@ -188,8 +190,9 @@ void pollControllerInput(ButtonSender sender)
         sender
     );
 
-    // D-pad and left stick both drive rotary list navigation. Holding a
-    // direction repeats the step after the initial delay.
+    // D-pad and left stick drive list navigation. Horizontal movement uses
+    // rotary steps; vertical movement becomes a touch swipe in vita_input.cpp.
+    // Holding a direction repeats the step after the initial delay.
     uint8_t items = 0;
     if ((pad.buttons & SCE_CTRL_UP) || pad.ly <= ANALOG_LOW)
         items |= NAV_UP;
@@ -201,8 +204,8 @@ void pollControllerInput(ButtonSender sender)
         items |= NAV_RIGHT;
 
     static const ButtonMapping itemMappings[] = {
-        { NAV_UP,    inputs::ButtonCommand::PreviousItem },
-        { NAV_DOWN,  inputs::ButtonCommand::NextItem },
+        { NAV_UP,    inputs::ButtonCommand::ScrollUp },
+        { NAV_DOWN,  inputs::ButtonCommand::ScrollDown },
         { NAV_LEFT,  inputs::ButtonCommand::PreviousItem },
         { NAV_RIGHT, inputs::ButtonCommand::NextItem },
     };
