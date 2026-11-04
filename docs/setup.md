@@ -80,10 +80,9 @@ from `app0:vita_auto_usb_client.suprx`.
 
 ### While connected
 
-- **D-pad** or **left stick** navigates lists, including Spotify. Left/right
-  moves between items. Up/down scrolls the list vertically. Hold a direction
-  to keep moving.
-- **Right stick** moves focus in screens that use focus navigation.
+- **D-pad**, **left stick**, or **right stick** moves focus in all four
+  directions, including the Android Auto app grid and lists such as Spotify.
+  Hold a direction to keep moving.
 - **Cross** selects and **Circle** goes back.
 - **Triangle** toggles play/pause.
 - **L** and **R** skip to the previous or next track.
