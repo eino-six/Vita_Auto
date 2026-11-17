@@ -6,7 +6,7 @@
 int main()
 {
     vitaLogReset();
-    vitaLog("build=detach-recover-v1");
+    vitaLog("build=detach-recover-v1-saver");
     vitaLogInfo("main start");
     vitaLogInfo("mode=DIRECT_USB");
     const int result = app::run();

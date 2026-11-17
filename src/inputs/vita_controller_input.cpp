@@ -2,6 +2,8 @@
 
 #include "app/app_errors.h"
 #include "logger/vita_log.h"
+#include "video/screensaver.h"
+#include "video/video_pipeline.h"
 
 #include <cstddef>
 #include <psp2/ctrl.h>
@@ -17,13 +19,47 @@ static uint32_t g_reportedFocusDirections = 0;
 static uint32_t g_reportedItemDirections = 0;
 static uint64_t g_focusRepeatAtUs[4]{};
 static uint64_t g_itemRepeatAtUs[4]{};
+static uint64_t g_startHeldAtUs = 0;
+static bool g_screensaverWakeArmed = false;
+// Ignore the whole wake gesture, not just the poll that noticed it, so a held
+// button cannot leak into Android Auto once the display is visible again.
+static bool g_wakeSuppressUntilRelease = false;
 
 constexpr uint64_t NAVIGATION_REPEAT_DELAY_US = 350000;
 constexpr uint64_t NAVIGATION_REPEAT_INTERVAL_US = 120000;
+constexpr uint64_t SCREENSAVER_HOLD_US = 1000000;
 
 struct ButtonMapping {
     uint32_t mask;
     ButtonCommand command;
+};
+
+const ButtonMapping BUTTON_MAPPINGS[] = {
+    { SCE_CTRL_CIRCLE,   inputs::ButtonCommand::Back },
+    { SCE_CTRL_SQUARE,   inputs::ButtonCommand::VoiceAssistant },
+    { SCE_CTRL_CROSS,    inputs::ButtonCommand::Select },
+    { SCE_CTRL_LTRIGGER, inputs::ButtonCommand::Previous },
+    { SCE_CTRL_RTRIGGER, inputs::ButtonCommand::Next },
+    { SCE_CTRL_TRIANGLE, inputs::ButtonCommand::PlayPause },
+};
+
+constexpr uint8_t NAV_UP = 1u << 0;
+constexpr uint8_t NAV_DOWN = 1u << 1;
+constexpr uint8_t NAV_LEFT = 1u << 2;
+constexpr uint8_t NAV_RIGHT = 1u << 3;
+
+const ButtonMapping FOCUS_MAPPINGS[] = {
+    { NAV_UP,    inputs::ButtonCommand::Up },
+    { NAV_DOWN,  inputs::ButtonCommand::Down },
+    { NAV_LEFT,  inputs::ButtonCommand::Left },
+    { NAV_RIGHT, inputs::ButtonCommand::Right },
+};
+
+const ButtonMapping ITEM_MAPPINGS[] = {
+    { NAV_UP,    inputs::ButtonCommand::PreviousItem },
+    { NAV_DOWN,  inputs::ButtonCommand::NextItem },
+    { NAV_LEFT,  inputs::ButtonCommand::PreviousItem },
+    { NAV_RIGHT, inputs::ButtonCommand::NextItem },
 };
 
 template <size_t Count>
@@ -96,6 +132,30 @@ void sendNavigationChanges(
     }
 }
 
+// Blanking hides the UI that owns any held key. Release everything that was
+// already reported so the phone does not keep a navigation direction or media
+// button down while the display is off.
+void releaseReportedInput(ButtonSender sender, uint64_t nowUs)
+{
+    sendButtonChanges(BUTTON_MAPPINGS, 0, g_reportedControllerButtons, sender);
+    sendNavigationChanges(
+        FOCUS_MAPPINGS,
+        0,
+        g_reportedFocusDirections,
+        g_focusRepeatAtUs,
+        nowUs,
+        sender
+    );
+    sendNavigationChanges(
+        ITEM_MAPPINGS,
+        0,
+        g_reportedItemDirections,
+        g_itemRepeatAtUs,
+        nowUs,
+        sender
+    );
+}
+
 } // namespace
 
 void initControllerInput()
@@ -114,6 +174,9 @@ void initControllerInput()
         g_focusRepeatAtUs[index] = 0;
         g_itemRepeatAtUs[index] = 0;
     }
+    g_startHeldAtUs = 0;
+    g_screensaverWakeArmed = false;
+    g_wakeSuppressUntilRelease = false;
     vitaLogInfo("controller init mode=0x%08x", previousMode);
 }
 
@@ -130,6 +193,9 @@ void stopControllerInput()
         g_focusRepeatAtUs[index] = 0;
         g_itemRepeatAtUs[index] = 0;
     }
+    g_startHeldAtUs = 0;
+    g_screensaverWakeArmed = false;
+    g_wakeSuppressUntilRelease = false;
 }
 
 void pollControllerInput(ButtonSender sender)
@@ -142,21 +208,57 @@ void pollControllerInput(ButtonSender sender)
     if (sampleCount <= 0)
         return;
 
-    static const ButtonMapping buttonMappings[] = {
-        { SCE_CTRL_CIRCLE,   inputs::ButtonCommand::Back },
-        { SCE_CTRL_SQUARE,   inputs::ButtonCommand::VoiceAssistant },
-        { SCE_CTRL_CROSS,    inputs::ButtonCommand::Select },
-        { SCE_CTRL_LTRIGGER, inputs::ButtonCommand::Previous },
-        { SCE_CTRL_RTRIGGER, inputs::ButtonCommand::Next },
-        { SCE_CTRL_TRIANGLE, inputs::ButtonCommand::PlayPause },
-    };
+    const uint64_t nowUs = sceKernelGetSystemTimeWide();
 
-    sendButtonChanges(buttonMappings, pad.buttons, g_reportedControllerButtons, sender);
+    if (video::screensaver::active()) {
+        g_startHeldAtUs = 0;
 
-    constexpr uint8_t NAV_UP = 1u << 0;
-    constexpr uint8_t NAV_DOWN = 1u << 1;
-    constexpr uint8_t NAV_LEFT = 1u << 2;
-    constexpr uint8_t NAV_RIGHT = 1u << 3;
+        // Start is still held when it blanks the screen. Arm wake only after
+        // every button is released, so blanking cannot immediately undo itself.
+        if (pad.buttons == 0) {
+            g_screensaverWakeArmed = true;
+            return;
+        }
+
+        if (g_screensaverWakeArmed) {
+            g_screensaverWakeArmed = false;
+            g_wakeSuppressUntilRelease = true;
+            // The wake press belongs to the display, not to Android Auto.
+            video::screensaver::wake();
+        }
+        return;
+    }
+
+    if (g_wakeSuppressUntilRelease) {
+        if (pad.buttons == 0)
+            g_wakeSuppressUntilRelease = false;
+        return;
+    }
+
+    if (pad.buttons & SCE_CTRL_START) {
+        if (!video::pipeline::hasPresentedFrame()) {
+            // Do not count the hold until there is a visible picture to hide.
+            g_startHeldAtUs = nowUs;
+        } else if (g_startHeldAtUs == 0) {
+            g_startHeldAtUs = nowUs;
+        } else if (nowUs - g_startHeldAtUs >= SCREENSAVER_HOLD_US &&
+                   video::screensaver::activate()) {
+            releaseReportedInput(sender, nowUs);
+            g_startHeldAtUs = 0;
+            g_screensaverWakeArmed = false;
+            return;
+        }
+    } else {
+        g_startHeldAtUs = 0;
+    }
+
+    sendButtonChanges(
+        BUTTON_MAPPINGS,
+        pad.buttons,
+        g_reportedControllerButtons,
+        sender
+    );
+
     constexpr uint8_t ANALOG_LOW = 64;
     constexpr uint8_t ANALOG_HIGH = 192;
 
@@ -170,18 +272,12 @@ void pollControllerInput(ButtonSender sender)
     if (pad.rx >= ANALOG_HIGH)
         focus |= NAV_RIGHT;
 
-    static const ButtonMapping focusMappings[] = {
-        { NAV_UP,    inputs::ButtonCommand::Up },
-        { NAV_DOWN,  inputs::ButtonCommand::Down },
-        { NAV_LEFT,  inputs::ButtonCommand::Left },
-        { NAV_RIGHT, inputs::ButtonCommand::Right },
-    };
     sendNavigationChanges(
-        focusMappings,
+        FOCUS_MAPPINGS,
         focus,
         g_reportedFocusDirections,
         g_focusRepeatAtUs,
-        sceKernelGetSystemTimeWide(),
+        nowUs,
         sender
     );
 
@@ -195,18 +291,12 @@ void pollControllerInput(ButtonSender sender)
     if ((pad.buttons & SCE_CTRL_RIGHT) || pad.lx >= ANALOG_HIGH)
         items |= NAV_RIGHT;
 
-    static const ButtonMapping itemMappings[] = {
-        { NAV_UP,    inputs::ButtonCommand::PreviousItem },
-        { NAV_DOWN,  inputs::ButtonCommand::NextItem },
-        { NAV_LEFT,  inputs::ButtonCommand::PreviousItem },
-        { NAV_RIGHT, inputs::ButtonCommand::NextItem },
-    };
     sendNavigationChanges(
-        itemMappings,
+        ITEM_MAPPINGS,
         items,
         g_reportedItemDirections,
         g_itemRepeatAtUs,
-        sceKernelGetSystemTimeWide(),
+        nowUs,
         sender
     );
 }

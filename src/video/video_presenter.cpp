@@ -1,4 +1,5 @@
 #include "video/video_presenter.h"
+#include "video/screensaver.h"
 #include "video/status_screen.h"
 #include "logger/vita_log.h"
 #include "app/config.h"
@@ -114,6 +115,7 @@ void init()
 bool shutdown()
 {
     if (video::isGxmScalerReady()) {
+        video::screensaver::shutdown();
         video::shutdownStatusScreen();
         // Finish old display callbacks before selecting a persistent CPU buffer.
         // libvita2d_fini frees its scanout buffers; the display must have stopped
@@ -145,6 +147,8 @@ bool presentCpuFallback(const video::DecodedFrame& frame)
 void presentStatus(const char* title, const char* detail, const char* error,
                    const char* action, const char* audio)
 {
+    // A connection/error screen must never stay hidden behind the clock.
+    video::screensaver::wakeForStatus();
     if (!video::isGxmScalerReady())
         init();
     video::drawStatusScreen(title, detail, error, action, audio);

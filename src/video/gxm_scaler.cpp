@@ -11,6 +11,7 @@
 
 #include "logger/vita_log.h"
 #include "logger/performance.h"
+#include "video/screensaver.h"
 
 namespace video {
 namespace {
@@ -243,6 +244,14 @@ bool presentFrameWithGpu(const DecodedFrame& frame)
     if (!g_ready || frame.pixels == nullptr || frame.width == 0 || frame.height == 0)
         return false;
 
+    // While blanked the session and decoder keep running, but libvita2d only
+    // displays the black clock scene. Skipping the upload also avoids touching
+    // AVCDEC's current output picture until the next visible frame.
+    if (video::screensaver::active()) {
+        video::screensaver::tick();
+        return true;
+    }
+
     g_lastFrameTiming = {};
     const uint64_t totalStart = logger::performance::nowUs();
 
@@ -268,10 +277,20 @@ bool presentFrameWithGpu(const DecodedFrame& frame)
     const float yScale =
         static_cast<float>(app::config::SCREEN_HEIGHT) / static_cast<float>(frame.height);
 
+    int shiftX = 0;
+    int shiftY = 0;
+    video::screensaver::pixelShift(shiftX, shiftY);
+
     const uint64_t drawStart = logger::performance::nowUs();
     vita2d_start_drawing();
     vita2d_clear_screen();
-    vita2d_draw_texture_scale(drawTexture, 0.0f, 0.0f, xScale, yScale);
+    vita2d_draw_texture_scale(
+        drawTexture,
+        static_cast<float>(shiftX),
+        static_cast<float>(shiftY),
+        xScale,
+        yScale
+    );
     vita2d_end_drawing();
 
     // The decoder mutex is held by the caller. In zero-copy mode this fence

@@ -3,6 +3,7 @@
 #include "app/app_errors.h"
 #include "logger/performance.h"
 #include "logger/vita_log.h"
+#include "video/screensaver.h"
 
 #include <psp2/touch.h>
 
@@ -18,6 +19,8 @@ static uint16_t g_lastTouchX = 0;
 static uint16_t g_lastTouchY = 0;
 static uint32_t g_touchReportsSent = 0;
 static uint32_t g_touchSendFailures = 0;
+// After the screensaver wakes, wait for a clean lift before forwarding contact.
+static bool g_touchSuppressed = false;
 
 // Must match the touch area advertised in service discovery (16:9, 720p).
 constexpr uint32_t AA_TOUCH_WIDTH = 1280;
@@ -53,6 +56,7 @@ void initTouchInput()
     g_touchSamplingStarted = sampleResult >= 0;
     g_touchReportsSent = 0;
     g_touchSendFailures = 0;
+    g_touchSuppressed = false;
     vitaLogInfo(
         "touch init info=0x%08x sample=0x%08x aa=1280x720 panel=%d,%d-%d,%d",
         infoResult,
@@ -74,6 +78,7 @@ void stopTouchInput()
 
     g_touchSamplingStarted = false;
     g_touchWasDown = false;
+    g_touchSuppressed = false;
 }
 
 // Send edges immediately; suppress tiny movements while a contact stays down.
@@ -87,31 +92,52 @@ void pollTouchInput(TouchSender sender)
     if (sampleCount <= 0)
         return;
 
-    if (touch.reportNum == 0) {
-        if (g_touchWasDown) {
-            inputs::TouchEvent event;
-            event.action = inputs::TouchAction::Up;
-            event.x = g_lastTouchX;
-            event.y = g_lastTouchY;
-            const bool sent = sender(event);
-            if (sent) {
-                ++g_touchReportsSent;
-                if (VITA_AUTO_VERBOSE_LOGGING) {
-                    vitaLogInfo(
-                        "touch tx action=up x=%u y=%u reports=%u",
-                        g_lastTouchX,
-                        g_lastTouchY,
-                        g_touchReportsSent
-                    );
-                }
-                g_touchWasDown = false;
-                performance::endGesture(performance::nowUs(), g_touchReportsSent);
-            } else {
-                ++g_touchSendFailures;
-                if (VITA_AUTO_VERBOSE_LOGGING)
-                    vitaLogInfo("touch tx failed action=up failures=%u", g_touchSendFailures);
+    auto releaseContact = [&]() {
+        if (!g_touchWasDown)
+            return;
+
+        inputs::TouchEvent event;
+        event.action = inputs::TouchAction::Up;
+        event.x = g_lastTouchX;
+        event.y = g_lastTouchY;
+        const bool sent = sender(event);
+        if (sent) {
+            ++g_touchReportsSent;
+            if (VITA_AUTO_VERBOSE_LOGGING) {
+                vitaLogInfo(
+                    "touch tx action=up x=%u y=%u reports=%u",
+                    g_lastTouchX,
+                    g_lastTouchY,
+                    g_touchReportsSent
+                );
             }
+            g_touchWasDown = false;
+            performance::endGesture(performance::nowUs(), g_touchReportsSent);
+        } else {
+            ++g_touchSendFailures;
+            if (VITA_AUTO_VERBOSE_LOGGING)
+                vitaLogInfo("touch tx failed action=up failures=%u", g_touchSendFailures);
         }
+    };
+
+    if (video::screensaver::active()) {
+        // Stop the hidden UI from seeing rain/glove contact. A contact that was
+        // already down when the screen blanked is released once.
+        g_touchSuppressed = true;
+        releaseContact();
+        return;
+    }
+
+    // A finger may still be on the glass when the display wakes. Ignore touch
+    // until the panel reports a clean lift so the wake tap cannot click.
+    if (g_touchSuppressed) {
+        if (touch.reportNum == 0)
+            g_touchSuppressed = false;
+        return;
+    }
+
+    if (touch.reportNum == 0) {
+        releaseContact();
         return;
     }
 

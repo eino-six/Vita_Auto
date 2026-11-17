@@ -79,6 +79,7 @@ add_executable(vita_auto
     src/video/h264_annexb.cpp
     src/video/video_pipeline.cpp
     src/video/video_presenter.cpp
+    src/video/screensaver.cpp
     src/video/status_screen.cpp
     src/video/vita_h264_decoder.cpp
 )
@@ -126,6 +127,8 @@ target_link_libraries(vita_auto PRIVATE
     SceDisplay_stub
     SceGxm_stub
     ScePvf_stub
+    SceRtc_stub
+    ScePower_stub
     SceAppMgr_stub
     SceCommonDialog_stub
     SceShellSvc_stub

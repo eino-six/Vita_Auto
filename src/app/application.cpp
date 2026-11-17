@@ -7,6 +7,7 @@
 #include "app/usb_shell_lock.h"
 #include "inputs/vita_input.h"
 #include "transport/usb_transport.h"
+#include "video/screensaver.h"
 #include "video/video_pipeline.h"
 #include "video/video_presenter.h"
 #include "logger/performance.h"
@@ -142,6 +143,7 @@ int run()
                 inputs::sample();
             if (!disconnectRequested && video::pipeline::present())
                 streaming = true;
+            video::screensaver::tick();
         }
 
         if (nowUs >= nextUiPollUs) {

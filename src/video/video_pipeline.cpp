@@ -6,6 +6,7 @@
 #include "logger/vita_log.h"
 #include "video/gxm_scaler.h"
 #include "video/h264_annexb.h"
+#include "video/screensaver.h"
 #include "video/vita_h264_decoder.h"
 
 #include <psp2/kernel/threadmgr.h>
@@ -223,14 +224,20 @@ void acceptSessionMediaFrame(
 
 bool presentLatestDecodedFrameOnMainThread()
 {
+    // A wake must redraw the latest picture even when no new frame sequence
+    // arrived while the screensaver was covering the display.
+    const bool wakeRedraw = video::screensaver::takeWakeRedraw();
 
     const uint32_t availableSequence = __atomic_load_n(
         &g_decodedFrameSequence,
         __ATOMIC_ACQUIRE
     );
     // The released frame sequence also publishes the picture mutex created by IO.
-    if (availableSequence == g_presentedFrameSequence || g_decodedFrameMutex < 0)
+    if (g_decodedFrameMutex < 0 ||
+        (!wakeRedraw && availableSequence == g_presentedFrameSequence))
+    {
         return false;
+    }
     bool presented = false;
 
     // SceAvcdec owns the returned picture memory and may reuse it on the next
@@ -243,7 +250,8 @@ bool presentLatestDecodedFrameOnMainThread()
         &g_decodedFrameSequence,
         __ATOMIC_ACQUIRE
     );
-    if (lockedSequence != g_presentedFrameSequence && g_videoDecoder.hasFrame())
+    if ((wakeRedraw || lockedSequence != g_presentedFrameSequence) &&
+        g_videoDecoder.hasFrame())
     {
         const auto& frame = g_videoDecoder.latestFrame();
         if (video::presentFrameWithGpu(frame) || video::presenter::presentCpuFallback(frame)) {
